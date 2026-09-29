@@ -9,6 +9,10 @@
 投递一份文本或小文件，但**并发下只有一个提交者能成功写入**；取件令牌在内容提交前
 查询得到 `pending`，提交后沿用同一套原子单次取件语义。
 
+持有多份投递的收件人还可以**批量取件**：一次提交 1～20 个取件令牌，
+**全部可领才一起消费**（全有或全无），按输入顺序返回全部文本；
+任一项不满足则整批失败，只回报各失败项的位置与原因，不消费其余项。
+
 - **FastAPI**（异步 HTTP + 自动 OpenAPI 文档）
 - **PostgreSQL**：投递内容与审计的唯一可信存储，**原子消费/原子提交的最终裁决者**
 - **Redis**：终态快速拒绝缓存（best-effort，宕机不影响正确性）
@@ -51,6 +55,7 @@ docker compose down -v
 | `POST` | `/api/v1/deliveries` | 创建文本投递（JSON） |
 | `POST` | `/api/v1/deliveries/file` | 创建小文件投递（multipart/form-data） |
 | `POST` | `/api/v1/pickup/{token}` | 凭令牌取件（**只能成功一次**） |
+| `POST` | `/api/v1/batch-pickup` | **批量取件**：1～20 个取件令牌一次性领齐（**全有或全无**） |
 | `POST` | `/api/v1/revoke/{token}` | 发送者撤回投递 |
 | `POST` | `/api/v1/blind-slots` | **盲投递**：收件人创建空槽，返回提交令牌 + 私有取件令牌 |
 | `POST` | `/api/v1/blind-slots/submit/{submit_token}` | **盲投递**：凭提交令牌写入文本（并发仅一人成功） |
@@ -266,6 +271,101 @@ curl -s -X POST "http://localhost:8000/api/v1/blind-slots/revoke/Wd9X…"
 
 ---
 
+## 批量取件（一次领齐多份文本）
+
+收件人持有多份投递的取件令牌时，可以**一个请求全部领齐**。
+接口接受按顺序排列的 **1～20 个**普通投递或盲槽**取件**令牌，
+遵循**全有或全无**语义：
+
+- 全部令牌都对应「已提交、未到期且未消费/撤回的**文本**」时，才**一起消费**，
+  并按输入顺序返回投递 ID、文本与内容哈希；
+- 任一项不满足时**整批失败**（HTTP 409）：不返回任何内容、也不消费其余项，
+  响应只列出各**失败项**的输入位置与原因；
+- 空列表、超过 20 个或存在重复令牌：整批拒绝（HTTP 422，参数校验）；
+- 文件投递在批量取件中报 `type_mismatch`（请走单件取件拿到二进制流）；
+  盲槽**提交**令牌按 `unknown` 处理（它本就不具备取件权限）；
+- 到期时刻等于裁决时刻即视为过期（`expires_at > 裁决时刻` 才可领取）。
+
+### 9) 批量取件成功
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/batch-pickup \
+  -H 'Content-Type: application/json' \
+  -d '{"tokens": ["U9rX…普通投递令牌…", "Wd9X…盲槽取件令牌…", "mQ2z…另一份…"]}'
+```
+
+```json
+{
+  "result": "success",
+  "items": [
+    {"position": 1, "delivery_id": "8f1c…", "content": "第一份文本", "content_sha256": "…"},
+    {"position": 2, "delivery_id": "3b2e…", "content": "盲投的第二份", "content_sha256": "…"},
+    {"position": 3, "delivery_id": "77aa…", "content": "第三份文本", "content_sha256": "…"}
+  ]
+}
+```
+
+`items` 严格按输入顺序排列，`position` 从 1 开始对应 `tokens` 的下标。
+此后这些令牌的单件/批量取件都会得到 `consumed`。
+
+### 10) 任一项不满足：整批失败，只报失败项
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/batch-pickup \
+  -H 'Content-Type: application/json' \
+  -d '{"tokens": ["好令牌A", "不存在的令牌", "好令牌B", "文件投递令牌"]}' -i
+# HTTP/1.1 409 Conflict
+```
+
+```json
+{
+  "result": "failed",
+  "failures": [
+    {"position": 2, "reason": "unknown"},
+    {"position": 4, "reason": "type_mismatch"}
+  ]
+}
+```
+
+`failures` 只包含失败项（位置 1、3 的好令牌不出现），**不返回任何内容**；
+位置 1、3 的投递**未被消费**，之后仍可正常取件。`reason` 取值：
+
+| `reason` | 含义 |
+| --- | --- |
+| `unknown` | 令牌不存在（含误用盲槽**提交**令牌） |
+| `pending` | 盲槽已创建但尚无提交者写入（待提交） |
+| `expired` | 投递已过期（到期时刻等于裁决时刻即过期） |
+| `consumed` | 内容已被成功取件 |
+| `revoked` | 投递已被撤回 |
+| `type_mismatch` | 投递是小文件而非文本（批量取件只领文本） |
+
+形状错误整批拒绝（HTTP 422）：`{"tokens": []}`、超过 20 个令牌、令牌重复。
+
+### 批量取件的并发与原子性
+
+裁决复用单件取件的模式，只依赖 PostgreSQL 的**单条条件 UPDATE**：
+
+```sql
+UPDATE deliveries
+SET status = 'consumed', consumed_at = now
+WHERE token_hash IN (:本批全部令牌哈希)
+  AND status = 'active'
+  AND kind = 'text'
+  AND expires_at > now
+RETURNING token_hash, id, content, …;
+```
+
+- 命中行数 **等于** 批大小：全部一起消费，同一事务提交；
+- 命中行数 **小于** 批大小：整批**回滚**——失败批次绝不留下部分消费，
+  随后在独立事务里惰性推进过期、读取当前状态，给出每项失败原因；
+- 重叠批次（共享同一令牌的两个批次）、批量与单件取件、批量与撤回并发时，
+  PostgreSQL 行锁把对同一行的更新串行化，**每份内容最多被成功领取一次**；
+  锁竞争（如死锁）由数据库检测后整批回滚重试；
+- 裁决**不读取任何缓存**：Redis 不可用时全有或全无语义依旧成立，
+  终态标记只在裁决后 best-effort 回写（与单件取件相同）。
+
+---
+
 ## 并发原子消费是如何保证的
 
 这是本服务的核心。正确性**只依赖 PostgreSQL 的单条条件更新**，不依赖应用层锁：
@@ -342,14 +442,17 @@ RETURNING id, submitted_at, …;
 所有关键动作写入 `audit_logs` 表，并且**每一条新日志（包括未知令牌等失败
 请求）都在同一个 PostgreSQL 事务中加入一条只增哈希链**：
 
-- 动作：`create` / `pickup` / `revoke`，以及盲投递的
+- 动作：`create` / `pickup` / `batch_pickup` / `revoke`，以及盲投递的
   `blind_create` / `blind_submit` / `blind_pickup` / `blind_revoke`
 - 结果：`success` / `consumed` / `revoked` / `expired` / `unknown` /
-  `pending` / `submitted`
+  `pending` / `submitted` / `type_mismatch`
 - 关联 `delivery_id`（可空）、`token_hash`、客户端 IP、User-Agent、时间与少量详情
 - **未知令牌的尝试也留痕并入链**（`delivery_id` 为空、仅记录哈希），便于暴力探测审计
 - 盲槽创建审计记录取件令牌哈希，并在 `detail.submit_token_hash` 中留存提交令牌
   哈希；提交类审计只记录提交令牌哈希，取件/撤回类审计只记录取件令牌哈希
+- 批量取件按**每个输入令牌一条**记录入链：成功批次每项一条 `success`，
+  失败批次每个失败项一条对应原因；`detail` 携带 `batch_id`（关联同批）、
+  `position` 与 `batch_size`，不记录明文令牌或内容
 
 明文内容不写入审计，也不会出现在任何导出/校验数据中。
 
@@ -487,10 +590,13 @@ pytest
 文件一次性下载、未知令牌与审计留痕，以及**盲投递全流程**（空槽 pending、
 一次性提交、**50 路并发提交仅一人成功其余均为 submitted**、提交/撤回竞争、
 撤回阻断提交与取件、pending/active 过期、两类令牌八个方向交叉使用全部
-`unknown`、提交成功响应不回传取件能力）和**哈希链入链/导出 NDJSON/五类
-篡改检测（缺行、乱序、重复、字段改写、链断裂并指出第一处）/40 路并发
-写入序号严格连续/链游标竞态失配重试**等用例。另在真实 PostgreSQL 上验证过
-100 路并发取件恰好 1 个赢家、30 组取件/撤回互斥。
+`unknown`、提交成功响应不回传取件能力）、**批量取件**（混合普通/盲槽令牌
+一次领齐、空列表/超限/重复整批拒绝、六类失败原因按位置上报且不消费其余项、
+**重叠批次并发仅一个整批赢家**、批量与单件取件/撤回并发互斥、失败批次不留
+部分消费、**缓存宕机仍全有或全无**、批次结果入链且不含明文）和**哈希链
+入链/导出 NDJSON/五类篡改检测（缺行、乱序、重复、字段改写、链断裂并指出
+第一处）/40 路并发写入序号严格连续/链游标竞态失配重试**等用例。另在真实
+PostgreSQL 上验证过 100 路并发取件恰好 1 个赢家、30 组取件/撤回互斥。
 
 ---
 

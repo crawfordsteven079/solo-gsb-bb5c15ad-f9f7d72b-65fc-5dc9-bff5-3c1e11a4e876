@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class CreateTextRequest(BaseModel):
@@ -84,6 +84,57 @@ class DenyResponse(BaseModel):
 
     result: str  # consumed | revoked | expired | unknown | submitted | pending
     detail: str
+
+
+# ---------------- 批量取件 ----------------
+
+
+class BatchPickupRequest(BaseModel):
+    """批量取件请求：按顺序排列的 1～20 个取件令牌。
+
+    空列表、超过 20 个或存在重复令牌时整批拒绝（422）。
+    """
+
+    tokens: list[str] = Field(
+        min_length=1,
+        max_length=20,
+        description="按顺序排列的取件令牌（普通投递或盲槽取件令牌），1～20 个，不得重复",
+    )
+
+    @field_validator("tokens")
+    @classmethod
+    def _reject_duplicate_tokens(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("取件令牌列表中存在重复令牌，整批拒绝")
+        return value
+
+
+class BatchPickupItem(BaseModel):
+    position: int = Field(description="输入位置（从 1 开始）")
+    delivery_id: uuid.UUID
+    content: str
+    content_sha256: str
+
+
+class BatchPickupResponse(BaseModel):
+    """整批成功：按输入顺序返回全部投递 ID、文本与内容哈希。"""
+
+    result: str = "success"
+    items: list[BatchPickupItem]
+
+
+class BatchPickupFailureItem(BaseModel):
+    position: int = Field(description="失败项的输入位置（从 1 开始）")
+    reason: str = Field(
+        description="unknown | pending | expired | consumed | revoked | type_mismatch"
+    )
+
+
+class BatchPickupFailureResponse(BaseModel):
+    """任一项不满足时的整批失败结果：只含各失败项的位置与原因，不含任何内容。"""
+
+    result: str = "failed"
+    failures: list[BatchPickupFailureItem]
 
 
 class RevokeResponse(BaseModel):

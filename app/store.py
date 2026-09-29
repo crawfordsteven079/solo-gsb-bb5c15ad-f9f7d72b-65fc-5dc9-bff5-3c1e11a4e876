@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass
 from datetime import datetime
 
 import sqlalchemy.exc
@@ -28,7 +29,7 @@ from .audit_chain import (
     event_digest_for,
 )
 from .models import AuditChainState, AuditLog, Delivery
-from .utils import utcnow
+from .utils import ensure_utc, utcnow
 
 # 可能的结果状态
 CONSUMED = "consumed"
@@ -38,6 +39,7 @@ ACTIVE = "active"
 PENDING = "pending"      # 盲投递空槽：收件人已开槽，尚无提交者写入
 SUBMITTED = "submitted"  # 提交竞争失败：槽已被另一个提交者占用
 UNKNOWN = "unknown"
+TYPE_MISMATCH = "type_mismatch"  # 批量取件：投递是小文件而非文本
 
 # 盲槽内容提交成功时的 kind，空槽阶段固定为 pending
 _PENDING_KIND = PENDING
@@ -74,6 +76,38 @@ _CHAIN_COLS = (
 
 # 链追加的竞争重试上限（正常竞争下通常 1~2 次即完成）
 _MAX_CHAIN_ATTEMPTS = 200
+
+# 批量取件的竞争重试上限（死锁/锁竞争或“评估时已全部就绪”的极端竞态）
+_MAX_BATCH_ATTEMPTS = 20
+
+
+@dataclass(frozen=True)
+class BatchItemOutcome:
+    """批量取件中单个输入令牌的裁决结果。
+
+    成功批次：outcomes 覆盖全部输入位置（ok=True，带明文内容，仅此一次取出）。
+    失败批次：outcomes 只含各失败项（ok=False，reason 为失败原因），
+    本可消费但被连坐的令牌不在其中，且绝不携带内容。
+    """
+
+    position: int                 # 输入位置（从 1 开始）
+    token_hash: str
+    ok: bool
+    reason: str | None = None     # unknown | pending | expired | consumed | revoked | type_mismatch
+    delivery_id: uuid.UUID | None = None
+    content: bytes | None = None
+    content_sha256: str | None = None
+    content_size: int | None = None
+
+
+def _is_contention_error(exc: sqlalchemy.exc.DBAPIError) -> bool:
+    """是否为并发竞争导致的可重试错误（死锁 / 锁等待 / 写快照忙）。"""
+    orig = getattr(exc, "orig", None)
+    sqlstate = getattr(orig, "sqlstate", None) or getattr(orig, "pgcode", None)
+    if sqlstate in {"40P01", "55P03", "40001"}:  # 死锁 / 锁不可用 / 串行化失败
+        return True
+    msg = str(orig or exc).lower()
+    return "deadlock" in msg or "locked" in msg or "busy" in msg
 
 
 class DeliveryStore:
@@ -427,6 +461,158 @@ class DeliveryStore:
         if current is None:
             return False, UNKNOWN, None
         return False, current.status, current
+
+    async def claim_batch(
+        self, token_hashes: list[str]
+    ) -> tuple[bool, list[BatchItemOutcome]]:
+        """批量原子取件：要么全部一起消费，要么一个都不消费。
+
+        入参为与输入顺序一一对应的取件令牌哈希（普通投递与盲槽取件令牌均可；
+        盲槽提交令牌的哈希不在 token_hash 列，自然落入 unknown）。
+
+        返回 (won, outcomes)：
+        - won=True：全部令牌都对应“已提交、未到期且未消费/撤回的文本”，
+          已在同一事务中一起置为 consumed；outcomes 按输入顺序携带明文内容
+          （内容仅此一次从事务中取出）。
+        - won=False：至少一项不满足，整批未消费任何投递（裁决 UPDATE 命中的
+          子集已随事务回滚）；outcomes 只含各失败项（输入位置 + 原因），
+          不含任何内容。
+
+        正确性说明：
+        - 唯一裁决点是单条条件 UPDATE ... WHERE token_hash IN (...) AND
+          status='active' AND kind='text' AND 未过期。PostgreSQL 用行锁
+          串行化并发更新：重叠批次、单件取件、撤回对同一行的竞争只有
+          一个赢家，每份内容最多被成功领取一次。
+        - 命中行数 < 令牌数即整批回滚——失败批次绝不留部分消费；随后在
+          独立事务里惰性推进过期并读取当前状态，给出每项失败原因。
+        - 裁决不读取任何缓存：Redis 不可用时全有或全无语义依旧成立。
+        """
+        unique_hashes = sorted(set(token_hashes))
+        for _attempt in range(1, _MAX_BATCH_ATTEMPTS + 1):
+            now = utcnow()
+            try:
+                result = await self.session.execute(
+                    update(Delivery)
+                    .where(
+                        Delivery.token_hash.in_(unique_hashes),
+                        Delivery.status == ACTIVE,
+                        Delivery.kind == "text",
+                        Delivery.expires_at > now,
+                    )
+                    .values(status=CONSUMED, consumed_at=now)
+                    .returning(
+                        Delivery.token_hash,
+                        Delivery.id,
+                        Delivery.content,
+                        Delivery.content_sha256,
+                        Delivery.content_size,
+                    )
+                )
+                won_rows = result.all()
+            except sqlalchemy.exc.DBAPIError as exc:
+                if not _is_contention_error(exc):
+                    raise
+                # 并发重叠批次等导致的死锁/锁竞争：整批回滚后重试
+                await self.session.rollback()
+                await asyncio.sleep(0)
+                continue
+
+            if len(won_rows) == len(unique_hashes):
+                await self.session.commit()
+                by_hash = {row.token_hash: row for row in won_rows}
+                return True, [
+                    BatchItemOutcome(
+                        position=position,
+                        token_hash=th,
+                        ok=True,
+                        delivery_id=by_hash[th].id,
+                        content=by_hash[th].content,
+                        content_sha256=by_hash[th].content_sha256,
+                        content_size=by_hash[th].content_size,
+                    )
+                    for position, th in enumerate(token_hashes, start=1)
+                ]
+
+            # 未全部命中：整批回滚，绝不留部分消费
+            await self.session.rollback()
+            failures = await self._batch_failures(token_hashes, unique_hashes)
+            if failures:
+                return False, failures
+            # 极端竞态：裁决时有项不可用，评估时已全部就绪
+            # （如空槽恰在期间被提交）——整体重试
+            await asyncio.sleep(0)
+
+        raise RuntimeError(f"批量取件在 {_MAX_BATCH_ATTEMPTS} 次竞争重试后仍未完成")
+
+    async def _batch_failures(
+        self, token_hashes: list[str], unique_hashes: list[str]
+    ) -> list[BatchItemOutcome]:
+        """失败批次的原因评估：先惰性推进过期（独立事务），再读当前状态。
+
+        只返回失败项；本可消费但因其它项连坐而未消费的令牌不在其中。
+        与 claim/revoke 相同：过期提升放在独立事务中执行，避免在旧快照里
+        回写而覆盖并发赢家刚提交的终态。
+        """
+        now = utcnow()
+        await self.session.execute(
+            update(Delivery)
+            .where(
+                Delivery.token_hash.in_(unique_hashes),
+                Delivery.status.in_((ACTIVE, PENDING)),
+                Delivery.expires_at <= now,
+            )
+            .values(status=EXPIRED, expired_at=now)
+        )
+        await self.session.commit()
+
+        rows = (
+            await self.session.execute(
+                select(
+                    Delivery.id,
+                    Delivery.token_hash,
+                    Delivery.status,
+                    Delivery.kind,
+                    Delivery.expires_at,
+                ).where(Delivery.token_hash.in_(unique_hashes))
+            )
+        ).all()
+        by_hash = {row.token_hash: row for row in rows}
+
+        failures: list[BatchItemOutcome] = []
+        for position, th in enumerate(token_hashes, start=1):
+            row = by_hash.get(th)
+            if row is None:
+                # 令牌不存在；盲槽提交令牌同样落在这里（按未知处理）
+                failures.append(
+                    BatchItemOutcome(position, th, ok=False, reason=UNKNOWN)
+                )
+                continue
+            state = row.status
+            if state in (ACTIVE, PENDING) and ensure_utc(row.expires_at) <= now:
+                # 到期时刻等于裁决时刻视为过期
+                state = EXPIRED
+            if state == ACTIVE:
+                if row.kind != "text":
+                    failures.append(
+                        BatchItemOutcome(
+                            position, th, ok=False,
+                            reason=TYPE_MISMATCH, delivery_id=row.id,
+                        )
+                    )
+                # 文本且可取件：本身不是失败项（批次因其它项失败而连坐）
+            elif state == PENDING:
+                failures.append(
+                    BatchItemOutcome(
+                        position, th, ok=False, reason=PENDING, delivery_id=row.id
+                    )
+                )
+            else:  # consumed | revoked | expired
+                failures.append(
+                    BatchItemOutcome(
+                        position, th, ok=False, reason=state, delivery_id=row.id
+                    )
+                )
+        return failures
 
     async def sweep_expired(self) -> int:
         """后台批量标记过期（惰性过期之外的兜底），返回影响行数。

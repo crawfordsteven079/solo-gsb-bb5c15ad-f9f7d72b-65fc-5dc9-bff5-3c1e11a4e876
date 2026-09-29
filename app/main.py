@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 
@@ -48,6 +49,11 @@ from .models import Delivery
 from .redis_client import DenyCache, create_redis
 from .schemas import (
     AuditVerifyResponse,
+    BatchPickupFailureItem,
+    BatchPickupFailureResponse,
+    BatchPickupItem,
+    BatchPickupRequest,
+    BatchPickupResponse,
     BlindCreateRequest,
     BlindCreateResponse,
     BlindPendingResponse,
@@ -910,6 +916,106 @@ async def pickup(
     )
 
 
+# ---------------- 批量取件（整批原子消费） ----------------
+
+
+@app.post(
+    "/api/v1/batch-pickup",
+    response_model=BatchPickupResponse,
+    tags=["deliveries"],
+    summary="批量取件：1～20 个取件令牌一次性领齐（全有或全无）",
+    responses={
+        200: {"description": "整批成功：按输入顺序返回全部投递 ID、文本与内容哈希"},
+        409: {
+            "model": BatchPickupFailureResponse,
+            "description": "任一项不满足：整批未消费，仅返回各失败项的输入位置与原因",
+        },
+        422: {"description": "空列表、超过 20 个或存在重复令牌：整批拒绝"},
+    },
+)
+async def batch_pickup(
+    payload: BatchPickupRequest,
+    request: Request,
+    store: DeliveryStore = Depends(get_store),
+    cache: DenyCache = Depends(get_cache),
+    cfg: Settings = Depends(get_settings),
+):
+    """收件人一次性领齐多份文本投递。
+
+    - 接受按顺序排列的 1～20 个普通投递或盲槽**取件**令牌
+      （盲槽提交令牌按未知处理；文件投递报类型不符）；
+    - 全部令牌都对应“已提交、未到期且未消费/撤回的文本”时，才一起消费，
+      并按输入顺序返回投递 ID、文本与内容哈希；
+    - 任一项不满足（未知/待提交/过期/已消费/已撤回/类型不符）时整批失败：
+      不返回任何内容，也不消费其余项，仅返回各失败项的位置与原因；
+    - 重叠批次、单件取件、撤回并发时，每份内容最多被成功领取一次，
+      失败批次不留部分消费；该保证只依赖数据库裁决，缓存不可用同样成立。
+    """
+    token_hashes = [hash_token(t) for t in payload.tokens]
+    batch_id = uuid.uuid4()
+    batch_size = len(token_hashes)
+
+    won, outcomes = await store.claim_batch(token_hashes)
+
+    if won:
+        for outcome in outcomes:
+            await _audit(
+                store,
+                action="batch_pickup",
+                result="success",
+                request=request,
+                delivery_id=outcome.delivery_id,
+                token_hash=outcome.token_hash,
+                detail={
+                    "batch_id": str(batch_id),
+                    "position": outcome.position,
+                    "batch_size": batch_size,
+                    "kind": "text",
+                    "size": outcome.content_size,
+                },
+            )
+        for outcome in outcomes:
+            await _remember_terminal(cache, outcome.token_hash, CONSUMED, cfg)
+        return BatchPickupResponse(
+            items=[
+                BatchPickupItem(
+                    position=outcome.position,
+                    delivery_id=outcome.delivery_id,
+                    content=outcome.content.decode("utf-8"),
+                    content_sha256=outcome.content_sha256,
+                )
+                for outcome in outcomes
+            ]
+        )
+
+    for outcome in outcomes:
+        await _audit(
+            store,
+            action="batch_pickup",
+            result=outcome.reason,
+            request=request,
+            delivery_id=outcome.delivery_id,
+            token_hash=outcome.token_hash,
+            detail={
+                "batch_id": str(batch_id),
+                "position": outcome.position,
+                "batch_size": batch_size,
+            },
+        )
+        if outcome.reason in (CONSUMED, REVOKED, EXPIRED):
+            await _remember_terminal(cache, outcome.token_hash, outcome.reason, cfg)
+
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content=BatchPickupFailureResponse(
+            failures=[
+                BatchPickupFailureItem(position=o.position, reason=o.reason)
+                for o in outcomes
+            ]
+        ).model_dump(mode="json"),
+    )
+
+
 # ---------------- 撤回 ----------------
 
 
@@ -1198,6 +1304,7 @@ async def root() -> dict:
             "POST /api/v1/deliveries",
             "POST /api/v1/deliveries/file",
             "POST /api/v1/pickup/{token}",
+            "POST /api/v1/batch-pickup",
             "POST /api/v1/revoke/{token}",
             "POST /api/v1/blind-slots",
             "POST /api/v1/blind-slots/submit/{submit_token}",

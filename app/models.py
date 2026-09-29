@@ -109,7 +109,7 @@ class AuditLog(Base):
     # 未匹配令牌的请求也需要留痕，此时只记录哈希
     token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(16), nullable=False)
-    # success | consumed | revoked | expired | unknown | pending | submitted
+    # success | consumed | revoked | expired | unknown | pending | submitted | type_mismatch
     result: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
     detail: Mapped[dict | None] = mapped_column(JSONBType, nullable=True)
     client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
