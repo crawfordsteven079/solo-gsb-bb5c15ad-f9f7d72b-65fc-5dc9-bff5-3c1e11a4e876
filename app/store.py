@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass
 from datetime import datetime
 
 import sqlalchemy.exc
@@ -28,7 +29,7 @@ from .audit_chain import (
     event_digest_for,
 )
 from .models import AuditChainState, AuditLog, Delivery
-from .utils import utcnow
+from .utils import ensure_utc, utcnow
 
 # 可能的结果状态
 CONSUMED = "consumed"
@@ -38,6 +39,7 @@ ACTIVE = "active"
 PENDING = "pending"      # 盲投递空槽：收件人已开槽，尚无提交者写入
 SUBMITTED = "submitted"  # 提交竞争失败：槽已被另一个提交者占用
 UNKNOWN = "unknown"
+TYPE_MISMATCH = "type_mismatch"  # 批量取件仅收文本：文件投递（普通/盲槽）一律类型不符
 
 # 盲槽内容提交成功时的 kind，空槽阶段固定为 pending
 _PENDING_KIND = PENDING
@@ -74,6 +76,53 @@ _CHAIN_COLS = (
 
 # 链追加的竞争重试上限（正常竞争下通常 1~2 次即完成）
 _MAX_CHAIN_ATTEMPTS = 200
+
+# 批量取件在死锁/快照过期下的整事务重试上限
+_MAX_BATCH_ATTEMPTS = 200
+
+
+@dataclass(frozen=True)
+class BatchClaimItem:
+    """批量取件中单个输入项的裁决视图。
+
+    position 为输入列表下标（从 0 开始）；state 为该项原因：
+    active（可消费文本）/ unknown / pending / expired / consumed /
+    revoked / type_mismatch。row 仅在命中时存在，仅供同事务内组装结果，
+    失败响应绝不从中取内容。
+    """
+
+    position: int
+    state: str
+    kind: str | None
+    row_id: uuid.UUID | None = None
+    row: Delivery | None = None
+
+
+@dataclass(frozen=True)
+class BatchClaimedContent:
+    """整批成功时，单项内容的不可变快照（裁决事务内提取，commit 后不再回库）。"""
+
+    position: int
+    delivery_id: uuid.UUID
+    content: bytes
+    content_sha256: str
+
+
+@dataclass(frozen=True)
+class BatchClaimOutcome:
+    """整批裁决结果：won=True 时 contents 按输入顺序携带文本快照。"""
+
+    won: bool
+    items: list[BatchClaimItem]
+    contents: list[BatchClaimedContent] | None = None
+    consumed_at: datetime | None = None
+
+
+def _is_pg_deadlock(exc: sqlalchemy.exc.OperationalError) -> bool:
+    """识别 PostgreSQL deadlock_detected（SQLSTATE 40P01）。"""
+    orig = getattr(exc, "orig", None)
+    return getattr(orig, "sqlstate", None) == "40P01"
+
 
 
 class DeliveryStore:
@@ -444,6 +493,237 @@ class DeliveryStore:
         )
         await self.session.commit()
         return result.rowcount or 0
+
+    # ---------------- 批量取件（一次性领齐） ----------------
+
+    async def claim_batch(
+        self, token_hashes: list[str]
+    ) -> "BatchClaimOutcome":
+        """原子批量消费：要么全部成功消费，要么一项也不消费。
+
+        入参为按输入顺序排列、已去重的取件令牌哈希（普通投递与盲槽取件
+        令牌均可；盲槽**提交**令牌查无此列，按 unknown 处理）。
+
+        裁决在单个事务内完成：
+
+        1. 用一条 ``SELECT ... WHERE token_hash IN (...) ORDER BY id FOR UPDATE``
+           锁定全部命中行。PostgreSQL 以行锁把并发单件取件/撤回/重叠批次
+           串行化；固定按 id 排序加锁，批次之间也不会互相死锁。
+        2. 在锁保护下逐项分类。任一项不可领即整体放弃：先回滚（不留下
+           任何部分消费），再在独立事务里惰性提升过期，返回各项原因。
+        3. 全部可领（普通/盲槽的文本，active 且未到期）时，以一条带
+           id 白名单的条件 UPDATE 完成整批 ``active→consumed``：在
+           READ COMMITTED 下，对其中任一行的并发修改都会阻塞并在锁释放
+           后按最新行版本重新判定 WHERE，竞争失败即整事务回滚重试，
+           因此绝不可能出现“消费了一半”的提交。
+
+        返回 ``BatchClaimOutcome``：won=True 时 rows 与 consumed_at
+        有效；won=False 时 items 给出每项（含全部输入项）的分类。
+        """
+        is_sqlite = self.session.bind.dialect.name == "sqlite"
+        last_error: Exception | None = None
+
+        for _attempt in range(1, _MAX_BATCH_ATTEMPTS + 1):
+            try:
+                rows = await self._lock_batch_rows(token_hashes)
+                items = self._classify_batch(token_hashes, rows)
+                claimable = [
+                    it for it in items if it.state == ACTIVE and it.kind == "text"
+                ]
+                if len(claimable) != len(token_hashes):
+                    # 至少一项不满足：整体放弃，事务回滚，不产生任何消费
+                    await self.session.rollback()
+                    await self._lazily_expire_batch(
+                        [it.row_id for it in items if it.row_id is not None]
+                    )
+                    return BatchClaimOutcome(won=False, items=items)
+
+                now = utcnow()
+                ids = [it.row_id for it in claimable]
+                # 在状态迁移前提取内容快照：bulk UPDATE 不刷新会话中的
+                # ORM 实例，commit 后更不能回读（避免并发下惰性 IO）。
+                contents = [
+                    BatchClaimedContent(
+                        position=it.position,
+                        delivery_id=it.row_id,
+                        content=it.row.content,
+                        content_sha256=it.row.content_sha256,
+                    )
+                    for it in claimable
+                ]
+                result = await self.session.execute(
+                    update(Delivery)
+                    .where(
+                        Delivery.id.in_(ids),
+                        Delivery.status == ACTIVE,
+                        Delivery.expires_at > now,
+                    )
+                    .values(status=CONSUMED, consumed_at=now)
+                    .execution_options(synchronize_session=False)
+                )
+                if result.rowcount != len(ids):
+                    # 锁等待期间有并发赢家（单件取件/撤回/另一批次）改写了
+                    # 其中某行：整事务回滚重试，绝不留下部分消费。
+                    await self.session.rollback()
+                    await asyncio.sleep(0)
+                    continue
+                await self.session.commit()
+                # contents 与输入顺序一致（claimable 按 items 顺序过滤）
+                return BatchClaimOutcome(
+                    won=True, items=items, contents=contents, consumed_at=now
+                )
+            except sqlalchemy.exc.OperationalError as exc:
+                last_error = exc
+                # PG：锁等待中被死锁检测器中止（40P01）；SQLite/WAL：
+                # 写事务快照过期（SQLITE_BUSY_SNAPSHOT）。均整事务回滚重试。
+                await self.session.rollback()
+                await asyncio.sleep(0)
+                if not is_sqlite and not _is_pg_deadlock(exc):
+                    raise
+                continue
+
+        raise RuntimeError(
+            f"批量取件在 {_MAX_BATCH_ATTEMPTS} 次尝试后仍未完成: {last_error!r}"
+        )
+
+    async def inspect_batch(
+        self, token_hashes: list[str]
+    ) -> list["BatchClaimItem"]:
+        """只读分类，不消费、不改状态（供快速拒绝路径给出各项原因）。
+
+        分类结果与 ``claim_batch`` 失败路径完全一致；读取后在独立事务中
+        惰性提升到期行，保持与单件取件相同的过期语义。
+        """
+        rows = await self._load_batch_rows(token_hashes)
+        items = self._classify_batch(token_hashes, rows)
+        await self.session.commit()
+        await self._lazily_expire_batch(
+            [it.row_id for it in items if it.row_id is not None]
+        )
+        return items
+
+    async def _lock_batch_rows(self, token_hashes: list[str]) -> list[Delivery]:
+        """锁定并返回全部命中的取件行（普通投递 + 盲槽），按 id 固定排序。
+
+        盲槽提交令牌（存于 submit_token_hash 列）不会命中，留待分类为
+        unknown。固定排序保证重叠批次按同一顺序申请行锁，杜绝批次间死锁。
+        """
+        stmt = (
+            select(Delivery)
+            .where(Delivery.token_hash.in_(token_hashes))
+            .order_by(Delivery.id.asc())
+        )
+        if self.session.bind.dialect.name == "postgresql":
+            stmt = stmt.with_for_update()
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def _load_batch_rows(self, token_hashes: list[str]) -> list[Delivery]:
+        """``_lock_batch_rows`` 的非加锁版本（只读快速拒绝路径）。"""
+        result = await self.session.execute(
+            select(Delivery).where(Delivery.token_hash.in_(token_hashes))
+        )
+        return list(result.scalars().all())
+
+    @staticmethod
+    def _classify_batch(
+        token_hashes: list[str], rows: list[Delivery]
+    ) -> list["BatchClaimItem"]:
+        """按输入顺序给出每项的裁决原因；锁内调用，行状态即裁决依据。
+
+        终态（consumed/revoked/expired）优先，随后对待裁决行判断到期；
+        active 且未到期的行中，文件投递（普通或盲槽）报 type_mismatch，
+        盲槽空槽报 pending（待提交），其余文本为可消费（state=active）。
+        到期时刻等于裁决时刻视为过期（expires_at <= now）。
+        """
+        now = utcnow()
+        by_hash = {row.token_hash: row for row in rows}
+        items: list[BatchClaimItem] = []
+        for position, token_h in enumerate(token_hashes):
+            row = by_hash.get(token_h)
+            if row is None:
+                items.append(
+                    BatchClaimItem(position=position, state=UNKNOWN, kind=None)
+                )
+                continue
+            if row.status in (CONSUMED, REVOKED, EXPIRED):
+                items.append(
+                    BatchClaimItem(
+                        position=position,
+                        state=row.status,
+                        kind=row.kind,
+                        row_id=row.id,
+                        row=row,
+                    )
+                )
+                continue
+            if ensure_utc(row.expires_at) <= now:
+                items.append(
+                    BatchClaimItem(
+                        position=position,
+                        state=EXPIRED,
+                        kind=row.kind,
+                        row_id=row.id,
+                        row=row,
+                    )
+                )
+                continue
+            if row.kind == "file":
+                # 批量取件只交付文本：文件投递（普通/盲槽）类型不符
+                items.append(
+                    BatchClaimItem(
+                        position=position,
+                        state=TYPE_MISMATCH,
+                        kind="file",
+                        row_id=row.id,
+                        row=row,
+                    )
+                )
+                continue
+            if row.status == PENDING or row.kind == PENDING:
+                items.append(
+                    BatchClaimItem(
+                        position=position,
+                        state=PENDING,
+                        kind=PENDING,
+                        row_id=row.id,
+                        row=row,
+                    )
+                )
+                continue
+            # active 且未到期的文本（普通投递或已提交盲槽）：可消费
+            items.append(
+                BatchClaimItem(
+                    position=position,
+                    state=ACTIVE,
+                    kind=row.kind,
+                    row_id=row.id,
+                    row=row,
+                )
+            )
+        return items
+
+    async def _lazily_expire_batch(self, row_ids: list) -> None:
+        """把本批命中行中已到期且仍可过期的行幂等地提升为 expired。
+
+        必须在调用方读/裁决事务结束后的*独立事务*中执行（与单件路径的
+        ``_lazily_expire`` 同理），避免旧快照覆盖并发赢家刚提交的终态；
+        同时覆盖普通投递与盲槽（本接口对两类取件令牌都有权限）。
+        """
+        if not row_ids:
+            return
+        now = utcnow()
+        await self.session.execute(
+            update(Delivery)
+            .where(
+                Delivery.id.in_(row_ids),
+                Delivery.status.in_((ACTIVE, PENDING)),
+                Delivery.expires_at <= now,
+            )
+            .values(status=EXPIRED, expired_at=now)
+            .execution_options(synchronize_session=False)
+        )
+        await self.session.commit()
 
     # ---------------- 审计哈希链 ----------------
 

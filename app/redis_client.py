@@ -60,6 +60,22 @@ class DenyCache:
     async def set_flag(self, token_hash: str, flag: str, ttl_seconds: int) -> None:
         await self.redis.set(self._key(token_hash), flag, ex=ttl_seconds)
 
+    async def get_flags(self, token_hashes: list[str]) -> dict[str, str]:
+        """批量读取取件令牌终态标记（MGET），返回 {token_hash: flag}。
+
+        仅包含已有标记的项；未标记的令牌不在字典中。终态标记单向不可逆，
+        因此命中即可作为该项不可再消费的依据（best-effort，仍以数据库为准）。
+        """
+        if not token_hashes:
+            return {}
+        values = await self.redis.mget([self._key(h) for h in token_hashes])
+        flags: dict[str, str] = {}
+        for token_h, value in zip(token_hashes, values):
+            if value is None:
+                continue
+            flags[token_h] = value.decode() if isinstance(value, bytes) else str(value)
+        return flags
+
     async def get_submit_flag(self, token_hash: str) -> str | None:
         value = await self.redis.get(self._submit_key(token_hash))
         if value is None:

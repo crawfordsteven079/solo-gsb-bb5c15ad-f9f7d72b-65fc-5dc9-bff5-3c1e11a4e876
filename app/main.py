@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta
 
@@ -48,6 +49,11 @@ from .models import Delivery
 from .redis_client import DenyCache, create_redis
 from .schemas import (
     AuditVerifyResponse,
+    BatchFailureItem,
+    BatchPickupFailureResponse,
+    BatchPickupItem,
+    BatchPickupRequest,
+    BatchPickupSuccessResponse,
     BlindCreateRequest,
     BlindCreateResponse,
     BlindPendingResponse,
@@ -61,12 +67,15 @@ from .schemas import (
     TextPickupResponse,
 )
 from .store import (
+    ACTIVE,
     CONSUMED,
     EXPIRED,
     PENDING,
     REVOKED,
     SUBMITTED,
+    TYPE_MISMATCH,
     UNKNOWN,
+    BatchClaimItem,
     DeliveryStore,
 )
 from .utils import (
@@ -104,6 +113,15 @@ _SUBMIT_DENY_DETAIL = {
     REVOKED: "空槽已被收件人撤回，无法再提交。",
     EXPIRED: "空槽已过期，无法再提交。",
     UNKNOWN: "提交令牌不存在。",
+}
+# 批量取件各项失败原因的中文说明（失败响应只回位置与原因，不含任何内容）
+_BATCH_REASON_DETAIL = {
+    UNKNOWN: "取件令牌不存在（盲槽提交令牌无取件权限，同样按未知处理）。",
+    PENDING: "盲槽尚无提交内容，处于待提交状态。",
+    EXPIRED: "投递已过期（到期时刻等于裁决时刻亦视为过期）。",
+    CONSUMED: "该内容已被成功领取，仅可读取一次。",
+    REVOKED: "投递已被撤回。",
+    TYPE_MISMATCH: "批量取件仅交付文本，该令牌对应文件投递，类型不符。",
 }
 
 
@@ -211,6 +229,15 @@ async def _fast_flag(cache: DenyCache, token_hash: str) -> str | None:
     except (redis.exceptions.RedisError, OSError):
         logger.warning("redis unavailable, falling back to database")
         return None
+
+
+async def _fast_flags(cache: DenyCache, token_hashes: list[str]) -> dict[str, str]:
+    """批量读 Redis 终态标记；Redis 故障时返回空字典，整体回落数据库裁决。"""
+    try:
+        return await cache.get_flags(token_hashes)
+    except (redis.exceptions.RedisError, OSError):
+        logger.warning("redis unavailable, batch pickup falls back to database")
+        return {}
 
 
 async def _fast_submit_flag(cache: DenyCache, token_hash: str) -> str | None:
@@ -910,6 +937,133 @@ async def pickup(
     )
 
 
+# ---------------- 批量取件（一次性领齐，原子整批消费） ----------------
+
+
+@app.post(
+    "/api/v1/pickups/batch",
+    tags=["deliveries"],
+    summary="批量取件：1～20 个普通/盲槽取件令牌一次性领齐（整批原子消费）",
+    responses={
+        200: {"model": BatchPickupSuccessResponse, "description": "全部领取成功（文本，按输入顺序返回）"},
+        409: {"model": BatchPickupFailureResponse, "description": "存在不可领取项，整批未消费任何内容"},
+        422: {"description": "空列表 / 超过 20 项 / 令牌重复"},
+    },
+)
+async def pickup_batch(
+    payload: BatchPickupRequest,
+    request: Request,
+    store: DeliveryStore = Depends(get_store),
+    cache: DenyCache = Depends(get_cache),
+    cfg: Settings = Depends(get_settings),
+):
+    """收件人一次性领取多份文本投递。
+
+    - 仅接受 1～20 个按顺序排列的**取件令牌**（普通文本投递或已提交盲槽
+      文本均可）；空列表、超限或重复令牌在接口层即整批拒绝（422）。
+    - 全部对应记录均为已提交（盲槽）、未到期且未消费/未撤回的**文本**时，
+      在单个数据库事务内整批原子消费，按输入顺序返回投递 ID、文本与内容
+      哈希；文件投递报 ``type_mismatch``，盲槽提交令牌无取件权限，按
+      ``unknown`` 处理。
+    - 任一项不满足（unknown/pending/expired/consumed/revoked/
+      type_mismatch）时，仅返回各失败项的输入位置（从 0 开始）与原因，
+      不返回任何内容，也不消费其余项。到期时刻等于裁决时刻视为过期。
+    - 重叠批次、现有单件取件与撤回并发时，每份内容至多被成功领取一次，
+      失败批次绝不留下部分消费；Redis 不可用时回落数据库裁决，规则不变。
+    """
+    tokens = payload.tokens
+    token_hashes = [hash_token(t) for t in tokens]
+    batch_id = uuid.uuid4()
+
+    def _failure(items: list[BatchClaimItem]) -> JSONResponse:
+        """仅回各失败项位置与原因；逐项入审计链（只记哈希，不记明文）。"""
+        failures = [
+            BatchFailureItem(position=it.position, reason=it.state)
+            for it in items
+            if it.state != "active"
+        ]
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content=BatchPickupFailureResponse(
+                batch_id=batch_id, failures=failures
+            ).model_dump(mode="json"),
+        )
+
+    async def _audit_items(
+        items: list[BatchClaimItem], *, action: str, outcome: str
+    ) -> None:
+        for it in items:
+            detail = {
+                "position": it.position,
+                "batch_id": str(batch_id),
+                "batch_size": len(tokens),
+            }
+            if it.kind:
+                detail["kind"] = it.kind
+            if outcome == "success":
+                result = "success"
+            else:
+                # 整批失败：真正失败项记其原因；本可领取但因同批他项失败而
+                # 未被消费的项记 failed（它们没有被消费）
+                result = it.state if it.state != ACTIVE else "failed"
+            await _audit(
+                store,
+                action=action,
+                result=result,
+                request=request,
+                delivery_id=it.row_id,
+                token_hash=token_hashes[it.position],
+                detail=detail,
+            )
+
+    # 1) Redis 终态快速预检（best-effort）：任一项已有终态标记，本批注定
+    #    无法整批成功，直接只读分类返回，避免无谓地锁行/裁决；Redis 故障
+    #    时返回空字典，完全回落数据库。正确性始终以数据库为唯一裁决者。
+    flags = await _fast_flags(cache, token_hashes)
+    if flags:
+        items = await store.inspect_batch(token_hashes)
+        await _audit_items(items, action="batch_pickup", outcome="failed")
+        return _failure(items)
+
+    # 2) 数据库单事务整批裁决：全可领则一起消费，否则整体回滚零消费
+    outcome_obj = await store.claim_batch(token_hashes)
+
+    if not outcome_obj.won:
+        await _audit_items(outcome_obj.items, action="batch_pickup", outcome="failed")
+        # 终态项回写快速拒绝缓存（pending/unknown/type_mismatch 非终态，不缓存）
+        for it in outcome_obj.items:
+            if it.state in (CONSUMED, REVOKED, EXPIRED):
+                await _remember_terminal(
+                    cache, token_hashes[it.position], it.state, cfg
+                )
+        return _failure(outcome_obj.items)
+
+    # 3) 整批赢家：每份文本只在此刻取出一次；逐项入链后随各自事务提交
+    await _audit_items(outcome_obj.items, action="batch_pickup", outcome="success")
+
+    resp_items: list[BatchPickupItem] = []
+    for content in outcome_obj.contents:
+        position = content.position
+        resp_items.append(
+            BatchPickupItem(
+                position=position,
+                delivery_id=content.delivery_id,
+                kind="text",
+                content=content.content.decode("utf-8"),
+                content_sha256=content.content_sha256,
+            )
+        )
+        await _remember_terminal(cache, token_hashes[position], CONSUMED, cfg)
+
+    resp_items.sort(key=lambda x: x.position)
+    return BatchPickupSuccessResponse(
+        batch_id=batch_id,
+        count=len(resp_items),
+        items=resp_items,
+        consumed_at=ensure_utc(outcome_obj.consumed_at) or utcnow(),
+    )
+
+
 # ---------------- 撤回 ----------------
 
 
@@ -1198,6 +1352,7 @@ async def root() -> dict:
             "POST /api/v1/deliveries",
             "POST /api/v1/deliveries/file",
             "POST /api/v1/pickup/{token}",
+            "POST /api/v1/pickups/batch",
             "POST /api/v1/revoke/{token}",
             "POST /api/v1/blind-slots",
             "POST /api/v1/blind-slots/submit/{submit_token}",
